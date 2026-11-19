@@ -160,9 +160,9 @@ jobs:
               "/p:VcpkgInstalledDir=$env:VCPKG_ROOT\installed\$env:TRIPLET",
               "/m",
               "/verbosity:detailed",
-              "/flp:LogFile=`"$logFile`";Verbosity=detailed;Encoding=UTF-8",
-              "/flp1:LogFile=`"$warnFile`";WarningsOnly;Verbosity=normal;Encoding=UTF-8",
-              "/flp2:LogFile=`"$errFile`";ErrorsOnly;Verbosity=normal;Encoding=UTF-8"
+              "/flp:LogFile=$logFile;Verbosity=detailed;Encoding=UTF-8",
+              "/flp1:LogFile=$warnFile;WarningsOnly;Verbosity=normal;Encoding=UTF-8",
+              "/flp2:LogFile=$errFile;ErrorsOnly;Verbosity=normal;Encoding=UTF-8"
             )
 
             if ($env:WINDOWS_SDK_VERSION) {
