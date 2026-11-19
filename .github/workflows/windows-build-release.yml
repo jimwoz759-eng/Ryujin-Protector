@@ -16,6 +16,7 @@ env:
   PLATFORM: x64
   TRIPLET: x64-windows
   PLATFORM_TOOLSET: v143
+  BUILDLOG_DIR: ${{ github.workspace }}\artifacts\buildlog
 
 jobs:
   build-windows-msvc:
@@ -112,22 +113,43 @@ jobs:
           $imgs = Join-Path $env:GITHUB_WORKSPACE "imgs"
           if (-not (Test-Path $imgs)) { New-Item -ItemType Directory -Path $imgs | Out-Null }
 
+      - name: Preparar diretório de logs de build (buildlog)
+        shell: pwsh
+        run: |
+          $logDir = $env:BUILDLOG_DIR
+          if (Test-Path $logDir) { Remove-Item -Recurse -Force $logDir }
+          New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+          Write-Host "Build log directory ready: $logDir"
+
       - name: Build da solução completa do Ryujin
         shell: pwsh
         run: |
           $repo = $env:GITHUB_WORKSPACE
           $msbuild = "msbuild"
           $slnPath = Join-Path $repo "RyujinConsole\Ryujin Protector.sln"
-          
+          $logDir = $env:BUILDLOG_DIR
+
           if (-not (Test-Path $slnPath)) {
             throw "Solution file not found: $slnPath"
           }
-          
+
           Write-Host "Building solution: $slnPath"
+          Write-Host "Build logs will be saved to: $logDir"
 
           $configs = @("Debug", "Release")
+          $buildResults = @()
+
           foreach ($config in $configs) {
+            Write-Host ""
+            Write-Host "========================================"
             Write-Host "Building $config configuration..."
+            Write-Host "========================================"
+
+            # 每個 config 對應一個詳細日誌文件
+            $logFile     = Join-Path $logDir "msbuild_${config}.log"
+            $warnFile    = Join-Path $logDir "msbuild_${config}_warnings.log"
+            $errFile     = Join-Path $logDir "msbuild_${config}_errors.log"
+
             $args = @(
               $slnPath,
               "/p:Configuration=$config",
@@ -136,18 +158,64 @@ jobs:
               "/p:VcpkgEnabled=true",
               "/p:VcpkgEnableManifest=true",
               "/p:VcpkgInstalledDir=$env:VCPKG_ROOT\installed\$env:TRIPLET",
-              "/m"
+              "/m",
+              "/verbosity:detailed",
+              "/flp:LogFile=`"$logFile`";Verbosity=detailed;Encoding=UTF-8",
+              "/flp1:LogFile=`"$warnFile`";WarningsOnly;Verbosity=normal;Encoding=UTF-8",
+              "/flp2:LogFile=`"$errFile`";ErrorsOnly;Verbosity=normal;Encoding=UTF-8"
             )
+
             if ($env:WINDOWS_SDK_VERSION) {
               Write-Host "Forcing WindowsTargetPlatformVersion to $env:WINDOWS_SDK_VERSION"
               $args += "/p:WindowsTargetPlatformVersion=$env:WINDOWS_SDK_VERSION"
             } else {
               Write-Host "No specific Windows SDK forced; using runner defaults."
             }
+
             & $msbuild @args
-            if ($LASTEXITCODE -ne 0) {
-              Write-Host "Build failed for $config, but continuing to next configuration..."
+            $rc = $LASTEXITCODE
+
+            # 寫入每個 config 的構建摘要
+            $summaryFile = Join-Path $logDir "msbuild_${config}_summary.log"
+            $status = if ($rc -eq 0) { "SUCCESS" } else { "FAILED (exit code $rc)" }
+            @"
+========================================
+Build Summary - $config
+========================================
+Solution : $slnPath
+Config   : $config
+Platform : $env:PLATFORM
+Toolset  : $env:PLATFORM_TOOLSET
+Status   : $status
+Timestamp: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC' -AsUTC)
+SHA      : $env:GITHUB_SHA
+Run ID   : $env:GITHUB_RUN_ID
+========================================
+"@ | Set-Content -Path $summaryFile -Encoding UTF8
+
+            $buildResults += [PSCustomObject]@{ Config = $config; ExitCode = $rc; Status = $status }
+
+            if ($rc -ne 0) {
+              Write-Host "::warning::Build FAILED for $config (exit code $rc) — check artifacts/buildlog/msbuild_${config}_errors.log"
+            } else {
+              Write-Host "Build SUCCEEDED for $config"
             }
+          }
+
+          # 全局摘要寫入 GITHUB_STEP_SUMMARY (Actions UI 可視化)
+          $mdSummary = "## 🔨 Ryujin Build Summary`n`n| Configuration | Status |`n|---|---|`n"
+          foreach ($r in $buildResults) {
+            $icon = if ($r.ExitCode -eq 0) { "✅" } else { "❌" }
+            $mdSummary += "| $($r.Config) | $icon $($r.Status) |`n"
+          }
+          $mdSummary += "`n> Detailed logs: **artifacts → buildlog**`n"
+          $mdSummary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+          Write-Host ""
+          Write-Host "=== BUILD LOG FILES GENERATED ==="
+          Get-ChildItem -Path $logDir -File | ForEach-Object {
+            $kb = [math]::Round($_.Length / 1KB, 1)
+            Write-Host (" - $($_.Name) ($kb KB)")
           }
 
       - name: Verificando arquivos de saída da BUILD da solução do Ryujin
@@ -188,11 +256,21 @@ jobs:
         shell: pwsh
         run: |
           $repo = $env:GITHUB_WORKSPACE
-          $artifactRoot = Join-Path $repo "artifacts"            # NEW staging folder
+          $artifactRoot = Join-Path $repo "artifacts"
+          $logDir       = $env:BUILDLOG_DIR   # artifacts\buildlog — must be preserved
           $excludeRegex = '\\.git\\|\\vcpkg_installed\\|\\vcpkg\\|\\.github\\'
 
-          if (Test-Path $artifactRoot) { Remove-Item -Recurse -Force $artifactRoot }
-          New-Item -ItemType Directory -Path $artifactRoot | Out-Null
+          # Limpar apenas subpastas que NÃO sejam buildlog
+          if (Test-Path $artifactRoot) {
+            Get-ChildItem -Path $artifactRoot -Directory | Where-Object { $_.FullName -ne $logDir } | ForEach-Object {
+              Remove-Item -Recurse -Force $_.FullName
+            }
+            Get-ChildItem -Path $artifactRoot -File | ForEach-Object {
+              Remove-Item -Force $_.FullName
+            }
+          } else {
+            New-Item -ItemType Directory -Path $artifactRoot | Out-Null
+          }
 
           Write-Host "=== COLLECTING BINARY FILES INTO ARTIFACT STAGING: $artifactRoot ==="
 
@@ -232,6 +310,15 @@ jobs:
           if ($finalFiles.Count -eq 0) {
             throw "No artifact files were collected into staging ($artifactRoot). Aborting — check filters and paths."
           }
+
+      - name: Upload dos logs de build como Artifact (buildlog)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: buildlog-${{ github.sha }}
+          path: ${{ github.workspace }}\artifacts\buildlog\
+          if-no-files-found: warn
+          retention-days: 30
 
       - name: Criando um arquivo ZIP com os arquivos binários de build da solução do Ryujin
         shell: pwsh
