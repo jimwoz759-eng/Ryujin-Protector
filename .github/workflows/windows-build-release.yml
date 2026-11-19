@@ -178,20 +178,22 @@ jobs:
             # 寫入每個 config 的構建摘要
             $summaryFile = Join-Path $logDir "msbuild_${config}_summary.log"
             $status = if ($rc -eq 0) { "SUCCESS" } else { "FAILED (exit code $rc)" }
-            @"
-========================================
-Build Summary - $config
-========================================
-Solution : $slnPath
-Config   : $config
-Platform : $env:PLATFORM
-Toolset  : $env:PLATFORM_TOOLSET
-Status   : $status
-Timestamp: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC' -AsUTC)
-SHA      : $env:GITHUB_SHA
-Run ID   : $env:GITHUB_RUN_ID
-========================================
-"@ | Set-Content -Path $summaryFile -Encoding UTF8
+            $ts = (Get-Date -AsUTC).ToString('yyyy-MM-dd HH:mm:ss UTC')
+            $summaryLines = @(
+              "========================================",
+              "Build Summary - $config",
+              "========================================",
+              "Solution : $slnPath",
+              "Config   : $config",
+              "Platform : $env:PLATFORM",
+              "Toolset  : $env:PLATFORM_TOOLSET",
+              "Status   : $status",
+              "Timestamp: $ts",
+              "SHA      : $env:GITHUB_SHA",
+              "Run ID   : $env:GITHUB_RUN_ID",
+              "========================================"
+            )
+            $summaryLines -join "`n" | Set-Content -Path $summaryFile -Encoding UTF8
 
             $buildResults += [PSCustomObject]@{ Config = $config; ExitCode = $rc; Status = $status }
 
