@@ -1,0 +1,474 @@
+name: Build (MSVC) and Publish compiled/ to Release
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+  COMPILED_DIR: compiled
+  BUILD_CONFIG_RELEASE: Release
+  BUILD_CONFIG_DEBUG: Debug
+  PLATFORM: x64
+  TRIPLET: x64-windows
+  PLATFORM_TOOLSET: v145
+  BUILDLOG_DIR: ${{ github.workspace }}\artifacts\buildlog
+
+jobs:
+  build-windows-msvc:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configurar o MSBuild
+        uses: microsoft/setup-msbuild@v1
+
+      - name: Detectar a Windows SDK e exporta-la como ENV
+        shell: pwsh
+        run: |
+          $includeRoot = 'C:\Program Files (x86)\Windows Kits\10\Include'
+          if (Test-Path $includeRoot) {
+            $versions = Get-ChildItem -Path $includeRoot -Directory -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Name -match '^\d+(\.\d+)+' } |
+                        Select-Object -ExpandProperty Name
+            if ($versions -and $versions.Count -gt 0) {
+              $best = $versions | Sort-Object { [version]$_ } -Descending | Select-Object -First 1
+              Write-Host "Found Windows SDK(s): $($versions -join ', '). Selecting: $best"
+              "WINDOWS_SDK_VERSION=$best" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            } else {
+              Write-Host "No numeric SDK folders found under $includeRoot. Will not force WindowsTargetPlatformVersion."
+            }
+          } else {
+            Write-Host "$includeRoot not present on runner. Will not force WindowsTargetPlatformVersion."
+          }
+
+      - name: Download e Configurar o VCPKG
+        shell: pwsh
+        run: |
+          $vroot = $env:VCPKG_ROOT
+          Write-Host "Setting up vcpkg at: $vroot"
+          
+          if (Test-Path $vroot) {
+            Remove-Item -Recurse -Force $vroot
+          }
+
+          $vcpkgUrl = "https://github.com/microsoft/vcpkg/archive/refs/heads/master.zip"
+          $zipPath = "vcpkg-master.zip"
+          Invoke-WebRequest -Uri $vcpkgUrl -OutFile $zipPath
+          
+          Expand-Archive -Path $zipPath -DestinationPath "vcpkg-temp" -Force
+          Move-Item -Path "vcpkg-temp\vcpkg-master" -Destination $vroot -Force
+          Remove-Item -Path "vcpkg-temp" -Recurse -Force
+          Remove-Item -Path $zipPath -Force
+          
+          Set-Location $vroot
+          Write-Host "Running bootstrap..."
+          .\bootstrap-vcpkg.bat
+
+          $vexe = Join-Path $vroot "vcpkg.exe"
+          if (Test-Path $vexe) {
+            Write-Host "SUCCESS: vcpkg.exe is ready"
+          } else {
+            throw "vcpkg.exe not found after setup"
+          }
+
+      - name: Instalar as dependências necessárias para compilar o Ryujin(vcpkg.json)
+        shell: pwsh
+        run: |
+          $repo = $env:GITHUB_WORKSPACE
+          $vexe = Join-Path $env:VCPKG_ROOT "vcpkg.exe"
+          if (-not (Test-Path $vexe)) { throw "vcpkg.exe not found at $vexe" }
+
+          Write-Host "Running vcpkg integrate install..."
+          & $vexe integrate install
+
+          $manifestFile = Join-Path $repo "vcpkg.json"
+          if (Test-Path $manifestFile) {
+            Write-Host "vcpkg.json found at repo root — using manifest mode to install dependencies"
+            Push-Location $repo
+            & $vexe install --triplet $env:TRIPLET
+            $rc = $LASTEXITCODE
+            Pop-Location
+            if ($rc -ne 0) { throw "vcpkg install (manifest) failed with exit code $rc" }
+          } else {
+            Write-Host "No vcpkg.json found — falling back to explicit package installs"
+            & $vexe install asmjit --triplet $env:TRIPLET --classic
+            & $vexe install zycore --triplet $env:TRIPLET --classic
+            & $vexe install zydis --triplet $env:TRIPLET --classic
+            & $vexe install z3 --triplet $env:TRIPLET --classic
+            & $vexe install wxwidgets --triplet $env:TRIPLET --classic
+          }
+
+      - name: Checando diretórios de recursos de Imagem para a GUI do Ryujin
+        shell: pwsh
+        run: |
+          $imgs = Join-Path $env:GITHUB_WORKSPACE "imgs"
+          if (-not (Test-Path $imgs)) { New-Item -ItemType Directory -Path $imgs | Out-Null }
+
+      - name: Preparar diretório de logs de build (buildlog)
+        shell: pwsh
+        run: |
+          $logDir = $env:BUILDLOG_DIR
+          if (Test-Path $logDir) { Remove-Item -Recurse -Force $logDir }
+          New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+          Write-Host "Build log directory ready: $logDir"
+
+      - name: Build da solução completa do Ryujin
+        id: build
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $repo = $env:GITHUB_WORKSPACE
+          $msbuild = "msbuild"
+          $slnPath = Join-Path $repo "RyujinConsole\Ryujin Protector.sln"
+          $logDir = $env:BUILDLOG_DIR
+
+          # Garante que o diretório de logs exista mesmo que algo abaixo falhe antes de criá-lo.
+          if (-not (Test-Path $logDir)) {
+            New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+          }
+
+          $configs = @("Debug", "Release")
+          $buildResults = @()
+          $overallRc = 0
+
+          function Write-FatalLog {
+            param([string]$Config, [string]$Message)
+            # Garante que SEMPRE exista pelo menos um log por config, mesmo que o
+            # MSBuild nunca tenha chegado a inicializar os seus próprios FileLoggers
+            # (ex.: falha de parsing de argumentos antes de qualquer build real).
+            $fatalFile = Join-Path $logDir "msbuild_${Config}_FATAL.log"
+            $Message | Set-Content -Path $fatalFile -Encoding UTF8
+            Write-Host "::error::$Message"
+          }
+
+          try {
+            if (-not (Test-Path $slnPath)) {
+              Write-FatalLog -Config "ALL" -Message "Solution file not found: $slnPath"
+              throw "Solution file not found: $slnPath"
+            }
+
+            Write-Host "Building solution: $slnPath"
+            Write-Host "Build logs will be saved to: $logDir"
+
+            foreach ($config in $configs) {
+              Write-Host ""
+              Write-Host "========================================"
+              Write-Host "Building $config configuration..."
+              Write-Host "========================================"
+
+              # Log bruto de console (stdout+stderr) — é o ÚNICO log que não depende
+              # de o MSBuild ter conseguido inicializar os seus próprios FileLoggers.
+              # Mesmo que o /flp/flp1/flp2 abaixo falhem ao abrir seus arquivos (ex.:
+              # erro de parsing ANTES de qualquer FileLogger ser criado), este arquivo
+              # ainda vai conter a mensagem de erro completa, porque é capturado no
+              # nível do processo pwsh, não pelo MSBuild.
+              $consoleLog = Join-Path $logDir "msbuild_${config}_console.log"
+
+              # Logs detalhados gerados pelo próprio MSBuild via FileLogger.
+              # Podem não existir se o MSBuild falhar antes de inicializá-los —
+              # é exatamente por isso que o $consoleLog acima existe como rede de segurança.
+              $logFile     = Join-Path $logDir "msbuild_${config}.log"
+              $warnFile    = Join-Path $logDir "msbuild_${config}_warnings.log"
+              $errFile     = Join-Path $logDir "msbuild_${config}_errors.log"
+
+              $args = @(
+                $slnPath,
+                "/p:Configuration=$config",
+                "/p:Platform=$env:PLATFORM",
+                "/p:PlatformToolset=$env:PLATFORM_TOOLSET",
+                "/p:VcpkgEnabled=true",
+                "/p:VcpkgEnableManifest=true",
+                "/p:VcpkgInstalledDir=$env:VCPKG_ROOT\installed\$env:TRIPLET",
+                "/m",
+                "/verbosity:detailed",
+                "/flp:LogFile=$logFile;Verbosity=detailed;Encoding=UTF-8",
+                "/flp1:LogFile=$warnFile;WarningsOnly;Verbosity=normal;Encoding=UTF-8",
+                "/flp2:LogFile=$errFile;ErrorsOnly;Verbosity=normal;Encoding=UTF-8"
+              )
+
+              if ($env:WINDOWS_SDK_VERSION) {
+                Write-Host "Forcing WindowsTargetPlatformVersion to $env:WINDOWS_SDK_VERSION"
+                $args += "/p:WindowsTargetPlatformVersion=$env:WINDOWS_SDK_VERSION"
+              } else {
+                Write-Host "No specific Windows SDK forced; using runner defaults."
+              }
+
+              $rc = -1
+              try {
+                # Redirecionamento de arquivo nativo do PowerShell (*>, não um
+                # pipe) para stdout+stderr combinados. Evitamos deliberadamente
+                # "& msbuild @args 2>&1 | Tee-Object ..." aqui: $LASTEXITCODE
+                # após um comando nativo atravessar um pipe não é garantido de
+                # forma consistente entre versões do PowerShell, e precisamos
+                # do exit code real do msbuild.exe para decidir se o build
+                # passou. O redirecionamento de arquivo puro abaixo não usa
+                # pipe nenhum, então $LASTEXITCODE abaixo é sempre o exit code
+                # do processo msbuild.exe em si. O GitHub Actions já grava por
+                # conta própria tudo que o step imprime no log da run, então
+                # não perdemos a visibilidade ao vivo por não usar Tee-Object.
+                & $msbuild @args *> $consoleLog
+                $rc = $LASTEXITCODE
+                # Como a saída foi redirecionada para arquivo (não para o
+                # console), ecoamos o conteúdo de volta para o log da run —
+                # assim quem está acompanhando a Action ao vivo ainda vê tudo.
+                Get-Content -Path $consoleLog -ErrorAction SilentlyContinue | Write-Host
+              } catch {
+                # Cobre o caso raro de o próprio '&' falhar ao iniciar o processo
+                # (ex.: msbuild.exe não encontrado no PATH).
+                $rc = 1
+                $_.Exception.Message | Add-Content -Path $consoleLog -Encoding UTF8
+                Write-FatalLog -Config $config -Message "Failed to launch msbuild: $($_.Exception.Message)"
+              }
+
+              if ($rc -ne 0 -and -not (Test-Path $logFile)) {
+                # O MSBuild retornou erro E nem chegou a criar o log detalhado —
+                # sinal de que o erro ocorreu antes da inicialização dos FileLoggers
+                # (como o MSB4104 de logger que motivou este hardening). O console
+                # log acima já tem o texto completo, mas deixamos isso explícito.
+                Write-FatalLog -Config $config -Message "msbuild exited with code $rc before its own FileLogger ($logFile) was created. See msbuild_${config}_console.log for the full console output, which is captured independently of MSBuild's internal loggers."
+              }
+
+              # Dados do Build atual (sempre escrito, mesmo em falha)
+              $summaryFile = Join-Path $logDir "msbuild_${config}_summary.log"
+              $status = if ($rc -eq 0) { "SUCCESS" } else { "FAILED (exit code $rc)" }
+              $ts = (Get-Date -AsUTC).ToString('yyyy-MM-dd HH:mm:ss UTC')
+              $summaryLines = @(
+                "========================================",
+                "Build Summary - $config",
+                "========================================",
+                "Solution : $slnPath",
+                "Config   : $config",
+                "Platform : $env:PLATFORM",
+                "Toolset  : $env:PLATFORM_TOOLSET",
+                "Status   : $status",
+                "Timestamp: $ts",
+                "SHA      : $env:GITHUB_SHA",
+                "Run ID   : $env:GITHUB_RUN_ID",
+                "========================================"
+              )
+              $summaryLines -join "`n" | Set-Content -Path $summaryFile -Encoding UTF8
+
+              $buildResults += [PSCustomObject]@{ Config = $config; ExitCode = $rc; Status = $status }
+              if ($rc -ne 0) { $overallRc = $rc }
+
+              if ($rc -ne 0) {
+                Write-Host "::warning::Build FAILED for $config (exit code $rc) — check artifacts/buildlog/msbuild_${config}_console.log and msbuild_${config}_errors.log"
+              } else {
+                Write-Host "Build SUCCEEDED for $config"
+              }
+            }
+          } catch {
+            # Qualquer exceção inesperada acima (ex.: sln não encontrado) cai aqui.
+            # Graças ao continue-on-error no step e a este catch, os passos
+            # seguintes (coleta de binários, upload do buildlog) ainda rodam.
+            Write-Host "::error::Unexpected failure while building: $($_.Exception.Message)"
+            $overallRc = 1
+            if ($buildResults.Count -eq 0) {
+              $buildResults += [PSCustomObject]@{ Config = "ALL"; ExitCode = 1; Status = "FAILED: $($_.Exception.Message)" }
+            }
+          }
+
+          # 全局摘要寫入 GITHUB_STEP_SUMMARY (Actions UI 可視化)
+          $mdSummary = "## 🔨 Ryujin Build Summary`n`n| Configuration | Status |`n|---|---|`n"
+          foreach ($r in $buildResults) {
+            $icon = if ($r.ExitCode -eq 0) { "✅" } else { "❌" }
+            $mdSummary += "| $($r.Config) | $icon $($r.Status) |`n"
+          }
+          $mdSummary += "`n> Detailed logs: **artifacts → buildlog** (always uploaded, success or failure)`n"
+          $mdSummary | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+          Write-Host ""
+          Write-Host "=== BUILD LOG FILES GENERATED ==="
+          Get-ChildItem -Path $logDir -File | ForEach-Object {
+            $kb = [math]::Round($_.Length / 1KB, 1)
+            Write-Host (" - $($_.Name) ($kb KB)")
+          }
+
+          # Expõe o resultado real para os steps seguintes via outputs — o step em
+          # si sempre "sucede" (continue-on-error), quem decide o status do job é
+          # o step dedicado "Avaliar resultado final do build" no final do workflow.
+          "overall_rc=$overallRc" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          if ($overallRc -ne 0) {
+            Write-Host "::warning::One or more configurations failed (overall_rc=$overallRc). Continuing to collect artifacts and logs before failing the job."
+          }
+
+      - name: Verificando arquivos de saída da BUILD da solução do Ryujin
+        shell: pwsh
+        run: |
+          $repo = $env:GITHUB_WORKSPACE
+          Write-Host "=== SEARCHING FOR ALL BUILD OUTPUTS IN WORKSPACE ==="
+          
+          $allBinaries = Get-ChildItem -Path $repo -Recurse -File -ErrorAction SilentlyContinue |
+                       Where-Object { 
+                         $_.Extension -match '\.(exe|dll|lib|pdb|exp)$' -and
+                         $_.FullName -notmatch '\\.git\\' -and
+                         $_.FullName -notmatch '\\vcpkg\\' -and
+                         $_.FullName -notmatch '\\.github\\'
+                       }
+          
+          Write-Host ("Found {0} binary files in workspace:" -f $allBinaries.Count)
+          $allBinaries | ForEach-Object {
+            $sizeKB = [math]::Round($_.Length / 1KB, 2)
+            Write-Host (" - {0} ({1} KB)" -f ($_.FullName.Replace($repo, '').TrimStart('\')), $sizeKB)
+          }
+          
+          Write-Host "=== CHECKING COMPILED DIRECTORIES ==="
+          $compiledDirs = @("compiled", "Compiled")
+          foreach ($dir in $compiledDirs) {
+            $fullPath = Join-Path $repo $dir
+            if (Test-Path $fullPath) {
+              Write-Host ("Contents of {0}:" -f $dir)
+              Get-ChildItem -Path $fullPath -Recurse -File -ErrorAction SilentlyContinue | ForEach-Object {
+                Write-Host (" - {0}" -f ($_.FullName.Replace($repo, '').TrimStart('\')))
+              }
+            } else {
+              Write-Host ("Directory not found: {0}" -f $dir)
+            }
+          }
+
+      - name: Coletando todos os binários de saída da Build da solução do Ryujin
+        shell: pwsh
+        run: |
+          $repo = $env:GITHUB_WORKSPACE
+          $artifactRoot = Join-Path $repo "artifacts"
+          $logDir       = $env:BUILDLOG_DIR   # artifacts\buildlog — must be preserved
+          $excludeRegex = '\\.git\\|\\vcpkg_installed\\|\\vcpkg\\|\\.github\\'
+
+          # Limpar apenas subpastas que NÃO sejam buildlog
+          if (Test-Path $artifactRoot) {
+            Get-ChildItem -Path $artifactRoot -Directory | Where-Object { $_.FullName -ne $logDir } | ForEach-Object {
+              Remove-Item -Recurse -Force $_.FullName
+            }
+            Get-ChildItem -Path $artifactRoot -File | ForEach-Object {
+              Remove-Item -Force $_.FullName
+            }
+          } else {
+            New-Item -ItemType Directory -Path $artifactRoot | Out-Null
+          }
+
+          Write-Host "=== COLLECTING BINARY FILES INTO ARTIFACT STAGING: $artifactRoot ==="
+
+          $allBinaries = Get-ChildItem -Path $repo -Recurse -File -ErrorAction SilentlyContinue |
+                         Where-Object {
+                           ($_.Extension -match '\.(exe|dll|lib|pdb|exp)$') -and
+                           ($_.FullName -notmatch [regex]::Escape($artifactRoot))
+                         }
+
+          $allBinaries = $allBinaries | Where-Object { -not ($_.FullName -match $excludeRegex) }
+
+          Write-Host ("Found {0} binary files to collect" -f $allBinaries.Count)
+
+          foreach ($file in $allBinaries) {
+            try {
+              $rel = $file.FullName.Substring($repo.Length).TrimStart('\','/')
+              $destPath = Join-Path $artifactRoot $rel
+              $destDir = Split-Path $destPath -Parent
+
+              if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
+
+              Copy-Item -Path $file.FullName -Destination $destPath -Force
+              Write-Host ("COPIED: {0} -> {1}" -f $file.FullName, $destPath)
+            } catch {
+              Write-Host ("ERROR copying {0}: {1}" -f $file.FullName, $_.Exception.Message)
+            }
+          }
+
+          $finalFiles = Get-ChildItem -Path $artifactRoot -Recurse -File -ErrorAction SilentlyContinue
+          Write-Host "=== FINAL COLLECTION SUMMARY ==="
+          Write-Host ("Total files collected into staging: {0}" -f $finalFiles.Count)
+          $finalFiles | ForEach-Object {
+            $sizeKB = [math]::Round($_.Length/1KB, 2)
+            Write-Host (" - {0} ({1} KB)" -f ($_.FullName.Substring($repo.Length).TrimStart('\')), $sizeKB)
+          }
+
+          if ($finalFiles.Count -eq 0) {
+            throw "No artifact files were collected into staging ($artifactRoot). Aborting — check filters and paths."
+          }
+
+      - name: Upload dos logs de build como Artifact (buildlog)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: buildlog-${{ github.sha }}
+          path: ${{ github.workspace }}\artifacts\buildlog\
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Criando um arquivo ZIP com os arquivos binários de build da solução do Ryujin
+        shell: pwsh
+        run: |
+          $repo = $env:GITHUB_WORKSPACE
+          $zipName = "ryujin-build-${{ github.sha }}.zip"
+          $stagingDir = Join-Path $repo "artifacts"
+
+          Write-Host ("Creating ZIP: {0} from {1}" -f $zipName, $stagingDir)
+
+          if (-not (Test-Path $stagingDir)) {
+            throw "Staging directory not found: $stagingDir"
+          }
+
+          if (Test-Path $zipName) { Remove-Item $zipName -Force }
+
+          Compress-Archive -Path (Join-Path $stagingDir '*') -DestinationPath $zipName -Force
+
+          if (-not (Test-Path $zipName)) {
+            throw "Failed to create zip: $zipName"
+          }
+
+          $zipInfo = Get-Item $zipName
+          Write-Host ("ZIP created: {0} (size: {1} MB)" -f $zipName, [math]::Round($zipInfo.Length/1MB, 2))
+          Write-Host "Sample of staging contents (first 100 files):"
+          Get-ChildItem -Path $stagingDir -Recurse -File | Select-Object -First 100 | ForEach-Object {
+            Write-Host (" - {0}" -f ($_.FullName.Substring($repo.Length).TrimStart('\')))
+          }
+
+      - name: Criando uma nova GitHub Release para o Ryujin
+        uses: softprops/action-gh-release@v2
+        if: success() || failure()
+        with:
+          tag_name: build-${{ github.sha }}
+          name: "Build ${{ github.sha }}"
+          body: |
+            Automated build based on last commit in branch "MAIN" by GitHub Actions CI
+
+            Commit: ${{ github.sha }}
+            Build date: ${{ github.event.head_commit.timestamp }}
+
+            Build Status/Integrity: overall_rc=${{ steps.build.outputs.overall_rc }} (0 = success, non-zero = failure)
+
+          files: |
+            ryujin-build-${{ github.sha }}.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Avaliar resultado final do build
+        # Este é o step que REALMENTE decide se o job falha ou não. O step de
+        # build acima usa continue-on-error:true de propósito — para garantir
+        # que a coleta de binários, o upload do buildlog e a criação da Release
+        # aconteçam MESMO quando o MSBuild falha. Mas isso faz com que o GitHub
+        # Actions marque o step de build como "sucesso" independentemente do
+        # resultado real, então precisamos deste step final, rodando por último
+        # e com "if: always()", para inspecionar o exit code real (overall_rc)
+        # e falhar o job explicitamente quando necessário.
+        if: always()
+        shell: pwsh
+        run: |
+          $rc = "${{ steps.build.outputs.overall_rc }}"
+          if ([string]::IsNullOrEmpty($rc)) {
+            Write-Host "::error::Could not determine build result (overall_rc output is missing) — treating as failure."
+            exit 1
+          }
+          if ($rc -ne "0") {
+            Write-Host "::error::Build failed (overall_rc=$rc). See the 'buildlog' artifact uploaded above for msbuild_<Config>_console.log (always present) and msbuild_<Config>_errors.log / msbuild_<Config>.log (present when MSBuild's own loggers initialized)."
+            exit 1
+          }
+          Write-Host "Build succeeded for all configurations (overall_rc=0)."

@@ -1,0 +1,3 @@
+LIBRARY RyujinObfuscator
+EXPORTS
+    RunRyujinCore = ?RunRyujinCore@@YAHPEBD00AEAVRyujinObfuscatorConfig@@@Z
